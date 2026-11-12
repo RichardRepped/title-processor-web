@@ -11,8 +11,9 @@ Rules applied:
        with real data:  Apple > Spotify > Tidal  -- applied wholesale to all rows.
     2. Blank rows (albums absent from a DSP) receive the same compound title as
        the other rows for that UPC.
-    3. Tidal-only UPCs: look for a sibling UPC sharing the same album name that
-       has Apple/Spotify data, and use that compound title.
+    3. Tidal-only UPCs: look for a sibling UPC sharing the same album name AND the
+       same number of audio tracks that has Apple/Spotify data, and use that compound
+       title. Artist names are not compared (Tidal often shows them differently).
     4. Remaining genuine edge cases are flagged in a REVIEW column placed
        immediately after the last column of the IMPORT sheet (AM in the current layout).
 
@@ -133,7 +134,9 @@ def compute_titles(df):
             elif was_blank:
                 res[i] = "propagated"
 
-    # Stage 2: album name -> Apple/Spotify title (from non-Tidal-only UPCs)
+    # Stage 2: (album name, track count) -> Apple/Spotify title (from non-Tidal-only UPCs)
+    # Track count must match as well as album name; artist names are deliberately NOT
+    # compared because Tidal often shows artist names differently.
     album_to_title = {}
     for u in order:
         if tidal[u]:
@@ -143,8 +146,10 @@ def compute_titles(df):
             rows = [i for i in real if plat[i] == p_]
             if rows:
                 i0 = rows[0]
-                if not _isna(alb[i0]) and not _isna(ct[i0]) and alb[i0] not in album_to_title:
-                    album_to_title[alb[i0]] = ct[i0]
+                key = (alb[i0], _n(trk[i0]))
+                if (not _isna(alb[i0]) and not _isna(ct[i0]) and key[1] != "unknown"
+                        and key not in album_to_title):
+                    album_to_title[key] = ct[i0]
                 break
 
     # Stage 3: Tidal-only UPCs
@@ -154,7 +159,8 @@ def compute_titles(df):
         idx = groups[u]
         t0 = next(i for i in idx if plat[i] == "Tidal")
         album = alb[t0]
-        sibling = album_to_title.get(album) if not _isna(album) else None
+        sibling = (album_to_title.get((album, _n(trk[t0])))
+                   if not _isna(album) else None)
         if sibling:
             auth, r_ = sibling, "sibling"
         else:
