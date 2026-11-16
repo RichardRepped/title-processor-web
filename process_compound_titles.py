@@ -17,8 +17,9 @@ Rules applied:
     4. UPCs that share an album (feat. suffixes ignored) with another UPC whose artist
        credit differs but overlaps are flagged SAME ALBUM, DIFFERENT ARTIST CREDIT
        (review only; titles are not changed; track count is ignored).
-    5. Remaining genuine edge cases are flagged in a REVIEW column placed
-       immediately after the last column of the IMPORT sheet (AM in the current layout).
+    5. Remaining genuine edge cases are flagged in a REVIEW column placed directly right of
+       the Excel table on the IMPORT sheet, with the table widened to include it so it can
+       be filtered (if that column is not free it goes after the last used column).
 
 Output format:
     .xlsm -- full macro workbook. The output zip is a copy of the source in which
@@ -37,7 +38,7 @@ Design notes (why it is written this way):
     * The run fails with an error if the number of cells written does not match.
 """
 
-import sys, os, re, zipfile, html
+import sys, os, re, zipfile, html, posixpath
 from decimal import Decimal
 from xml.sax.saxutils import escape
 from lxml import etree
@@ -391,6 +392,100 @@ def iter_cells(row_bytes):
         if rm:
             yield rm.group(1).decode(), attrs, inner, m
 
+def has_content(inner):
+    """True if a cell body holds a value or a formula (empty styled cells do not count)."""
+    return bool(inner) and (b"<f" in inner or b"<is>" in inner
+                            or re.search(rb"<v>[^<]", inner) is not None)
+
+
+# ── Excel table (ListObject) handling: put REVIEW inside the table so it can be filtered ──
+
+def _rels_targets(zin, part):
+    """[(relationship type, full part path)] for a part's .rels file."""
+    d, b = posixpath.split(part)
+    rp = f"{d}/_rels/{b}.rels"
+    if rp not in zin.namelist():
+        return []
+    out = []
+    for rel in re.findall(r"<Relationship\b[^>]*>", zin.read(rp).decode("utf-8")):
+        tgt = re.search(r'\bTarget="([^"]+)"', rel)
+        typ = re.search(r'\bType="([^"]+)"', rel)
+        if not tgt or not typ:
+            continue
+        t = tgt.group(1)
+        full = t.lstrip("/") if t.startswith("/") else posixpath.normpath(posixpath.join(d, t))
+        out.append((typ.group(1).rsplit("/", 1)[-1], full))
+    return out
+
+def find_import_table(zin, sheet_part):
+    """Describe the Excel table on the IMPORT sheet if it can be safely extended by one
+    column; otherwise return None (REVIEW is then placed outside the table)."""
+    for typ, tpart in _rels_targets(zin, sheet_part):
+        if typ != "table" or tpart not in zin.namelist():
+            continue
+        t = zin.read(tpart).decode("utf-8")
+        root = re.search(r"<table\b[^>]*>", t)
+        m = re.search(r'(?<![\w:])ref="([A-Z]+)(\d+):([A-Z]+)(\d+)"', root.group(0)) if root else None
+        if not m or m.group(2) != "1" or "totalsRowCount" in root.group(0):
+            continue
+        ids = [int(x) for x in re.findall(r"<tableColumn\b[^>]*?\bid=\"(\d+)\"", t)]
+        names = [html.unescape(x).strip().lower()
+                 for x in re.findall(r"<tableColumn\b[^>]*?\bname=\"([^\"]*)\"", t)]
+        cnt = re.search(r'<tableColumns count="(\d+)"', t)
+        if not ids or not cnt or int(cnt.group(1)) != len(ids) or "</tableColumns>" not in t:
+            continue
+        info = {"part": tpart, "xml": t, "last_col": col_to_num(m.group(3)),
+                "ref_end_row": int(m.group(4)), "max_id": max(ids), "names": names,
+                "query_part": None, "query_xml": None}
+        if 'tableType="queryTable"' in root.group(0):
+            # A Power Query table: its query-table part must list the new column too,
+            # exactly as Excel does for a column added to the right of the query output.
+            q = [p for ty, p in _rels_targets(zin, tpart) if ty == "queryTable" and p in zin.namelist()]
+            if not q:
+                continue
+            qx = zin.read(q[0]).decode("utf-8")
+            if not (re.search(r'<queryTableRefresh\b[^>]*\bnextId="\d+"', qx)
+                    and re.search(r'<queryTableRefresh\b[^>]*\bunboundColumnsRight="\d+"', qx)
+                    and re.search(r'<queryTableFields count="\d+">', qx)
+                    and "</queryTableFields>" in qx):
+                continue
+            info["query_part"], info["query_xml"] = q[0], qx
+        return info
+    return None
+
+def extend_table_xml(info, new_col_letter, name="REVIEW"):
+    """Return (table_xml, query_xml_or_None) with one extra column on the right."""
+    t = info["xml"]
+    new_id = info["max_id"] + 1
+    def widen(tag):
+        return re.sub(r'(?<![\w:])ref="([A-Z]+\d+):[A-Z]+(\d+)"',
+                      lambda m: 'ref="%s:%s%s"' % (m.group(1), new_col_letter, m.group(2)), tag, count=1)
+    root = re.search(r"<table\b[^>]*>", t).group(0)
+    t = t.replace(root, widen(root), 1)
+    af = re.search(r"<autoFilter\b[^>]*>", t)
+    if af:
+        t = t.replace(af.group(0), widen(af.group(0)), 1)
+    t = re.sub(r'<tableColumns count="(\d+)"',
+               lambda m: '<tableColumns count="%d"' % (int(m.group(1)) + 1), t, count=1)
+    q = info["query_xml"]
+    if q is None:
+        col = '<tableColumn id="%d" name="%s"/>' % (new_id, name)
+    else:
+        field_id = int(re.search(r'<queryTableRefresh\b[^>]*\bnextId="(\d+)"', q).group(1))
+        col = ('<tableColumn id="%d" uniqueName="%d" name="%s" queryTableFieldId="%d"/>'
+               % (new_id, new_id, name, field_id))
+        q = re.sub(r'(<queryTableRefresh\b[^>]*\bnextId=")\d+"',
+                   lambda m: '%s%d"' % (m.group(1), field_id + 1), q, count=1)
+        q = re.sub(r'(<queryTableRefresh\b[^>]*\bunboundColumnsRight=")(\d+)"',
+                   lambda m: '%s%d"' % (m.group(1), int(m.group(2)) + 1), q, count=1)
+        q = re.sub(r'<queryTableFields count="(\d+)">',
+                   lambda m: '<queryTableFields count="%d">' % (int(m.group(1)) + 1), q, count=1)
+        q = q.replace("</queryTableFields>",
+                      '<queryTableField id="%d" dataBound="0" tableColumnId="%d"/></queryTableFields>'
+                      % (field_id, new_id), 1)
+    t = t.replace("</tableColumns>", col + "</tableColumns>", 1)
+    return t, q
+
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
@@ -401,11 +496,13 @@ def process(input_path, output_path):
         sheet_part = find_sheet_part(zin, "IMPORT")
         ss_bytes = zin.read("xl/sharedStrings.xml")
         wb_bytes = zin.read("xl/workbook.xml")
+        tbl = find_import_table(zin, sheet_part)
     ss = read_shared_strings(ss_bytes)
     n_old_ss = len(ss)
 
     # ---- pass 1: header, data rows -> DataFrame, sheet extent (streamed) ----
     header_cols, last_col_num, last_hdr_style = {}, 0, None
+    used_cols = set()                    # columns holding a real value/formula anywhere
     records, rownums = [], []
     max_row, ct_style = 1, [None]
     wanted = {}
@@ -418,6 +515,8 @@ def process(input_path, output_path):
             if rnum == 1:
                 for col, attrs, inner, _ in iter_cells(data):
                     last_col_num = max(last_col_num, col_to_num(col))
+                    if has_content(inner):
+                        used_cols.add(col_to_num(col))
                     sm = S_ATTR.search(attrs)
                     last_hdr_style = sm.group(1) if sm else last_hdr_style
                     name = cell_text(attrs, inner, ss)
@@ -433,6 +532,8 @@ def process(input_path, output_path):
                 raise ValueError("Header row (row 1) of the IMPORT sheet was not found.")
             rec = {}
             for col, attrs, inner, _ in iter_cells(data):
+                if has_content(inner):
+                    used_cols.add(col_to_num(col))
                 if col in wanted:
                     rec[wanted[col]] = cell_text(attrs, inner, ss)
                 if col == header_cols["Compound title"] and ct_style[0] is None:
@@ -455,8 +556,27 @@ def process(input_path, output_path):
 
     if not records:
         raise ValueError("No data rows found on the IMPORT sheet.")
-    review_col = num_to_col(last_col_num + 1)
     ct_col = header_cols["Compound title"]
+
+    # Where REVIEW goes:
+    #  1. a REVIEW column already exists (file was processed before): reuse it, never add a second;
+    #  2. else directly right of the Excel table, if that column is free, and the table is widened
+    #     to include it (so it can be filtered);
+    #  3. else after the last used column, outside the table (never over existing data).
+    reuse_review = "REVIEW" in header_cols
+    extend_table = False
+    if reuse_review:
+        review_col = header_cols["REVIEW"]
+    else:
+        beyond = max(last_col_num, max(used_cols, default=0)) + 1
+        if (tbl and (tbl["last_col"] + 1) not in used_cols and "review" not in tbl["names"]
+                and tbl["last_col"] + 1 <= beyond):
+            review_col = num_to_col(tbl["last_col"] + 1)
+            extend_table = True
+        else:
+            review_col = num_to_col(beyond)
+    review_num = col_to_num(review_col)
+    dim_col_num = max(last_col_num, max(used_cols, default=0), review_num)
 
     df = pd.DataFrame(records, columns=REQUIRED_HEADERS)
     del records
@@ -508,7 +628,7 @@ def process(input_path, output_path):
     pos_of_row = {rn: p for p, rn in enumerate(rownums)}
     titles = compound_titles.tolist()
     reskeys = resolution.tolist()
-    review_hdr_idx = sidx("REVIEW")
+    review_hdr_idx = None if reuse_review else sidx("REVIEW")
     stats = {"written": 0, "refs_added": 0}
     ct_colb, rv_colb = ct_col.encode(), review_col.encode()
 
@@ -538,11 +658,12 @@ def process(input_path, output_path):
             return inner + make(b"")
 
         if is_header:
-            def hdr_cell(_):
-                st = (b' s="%s"' % last_hdr_style) if last_hdr_style else b""
-                return b'<c r="%s1"%s t="s"><v>%d</v></c>' % (rv_colb, st, review_hdr_idx)
-            inner = put(review_col, hdr_cell, inner)
-            stats["refs_added"] += 1
+            if not reuse_review:
+                def hdr_cell(_):
+                    st = (b' s="%s"' % last_hdr_style) if last_hdr_style else b""
+                    return b'<c r="%s1"%s t="s"><v>%d</v></c>' % (rv_colb, st, review_hdr_idx)
+                inner = put(review_col, hdr_cell, inner)
+                stats["refs_added"] += 1
         else:
             title, res = titles[pos], reskeys[pos]
             if isinstance(title, str) and title:
@@ -556,18 +677,32 @@ def process(input_path, output_path):
                 stats["written"] += 1
                 stats["refs_added"] += 1
             note = row_notes[pos]
+            def _keep_style(old_attrs):
+                sm = S_ATTR.search(old_attrs) if old_attrs else None
+                return (b' s="%s"' % sm.group(1)) if sm else b""
             if note:
                 nidx = sidx(note)
                 inner = put(review_col,
-                            lambda _: b'<c r="%s%d" t="s"><v>%d</v></c>' % (rv_colb, rnum, nidx),
+                            lambda old: b'<c r="%s%d"%s t="s"><v>%d</v></c>'
+                                        % (rv_colb, rnum, _keep_style(old), nidx),
                             inner)
                 stats["refs_added"] += 1
+            elif reuse_review and any(c_[0] == review_col and has_content(c_[2])
+                                      for c_ in iter_cells(inner)):
+                # file was processed before: clear a note that no longer applies
+                inner = put(review_col,
+                            lambda old: b'<c r="%s%d"%s/>' % (rv_colb, rnum, _keep_style(old)),
+                            inner)
         return new_open + inner + b"</row>"
+
+    new_tbl_xml = new_query_xml = None
+    if extend_table:
+        new_tbl_xml, new_query_xml = extend_table_xml(tbl, review_col)
 
     # ---- pass 2: stream the sheet through, writing the new output zip ----
     tmp_out = output_path + ".tmp"
     print(f"\nWriting: {output_path}")
-    dim_ref = b'A1:%s%d' % (rv_colb, max_row)
+    dim_ref = b'A1:%s%d' % (num_to_col(dim_col_num).encode(), max_row)
     try:
         with zipfile.ZipFile(input_path, "r") as zin, \
              zipfile.ZipFile(tmp_out, "w", zipfile.ZIP_DEFLATED) as zout:
@@ -583,6 +718,9 @@ def process(input_path, output_path):
                             fh.write(data)
                 elif item.filename in ("xl/sharedStrings.xml", "xl/workbook.xml"):
                     continue                      # written after the sheet (needs final counts)
+                elif extend_table and item.filename in (tbl["part"], tbl["query_part"]):
+                    zout.writestr(item, (new_tbl_xml if item.filename == tbl["part"]
+                                         else new_query_xml).encode("utf-8"))
                 else:
                     with zin.open(item) as src, zout.open(item, "w", force_zip64=True) as fh:
                         while True:
@@ -631,8 +769,11 @@ def process(input_path, output_path):
 
     flagged = n_flagged
     edge_upcs = len({u for u, x in zip(upc_list, row_notes) if x})
+    where = ("inside the Excel table, so it can be filtered" if extend_table else
+             "re-used from the earlier run" if reuse_review else
+             "outside the Excel table: to filter it, extend the table to include this column")
     print(f"Compound titles written: {stats['written']} of {len(df)} rows; "
-          f"REVIEW column: {review_col}")
+          f"REVIEW column: {review_col} ({where})")
     print(f"Done. {flagged} rows flagged across {edge_upcs} UPCs.\n")
 
 

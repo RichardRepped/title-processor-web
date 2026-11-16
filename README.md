@@ -45,4 +45,5 @@ Hand the repository to your developer. They will need to:
 - The workbook must contain an IMPORT sheet
 - Data should be refreshed (Data → Refresh All) and saved before uploading
 - Processed file is named `originalname_processed.xlsm`
-- The REVIEW column flags rows needing human decisions. It is added in the first column after the last used column of the IMPORT sheet (AM in the original template, AP in the Q5 Label Tranche 1 workbook), never over existing data
+- The REVIEW column flags rows needing human decisions. It is placed directly right of the Excel table (tblImport) and the table is widened to include it, so it can be filtered like any other column. If that column is not free it goes after the last used column, outside the table, and the app output says so. If a file is processed twice, the existing REVIEW column is reused and refreshed, never duplicated
+- REVIEW notes: MULTI-ARTIST, TIDAL-ONLY, NO DATA, and SAME ALBUM, DIFFERENT ARTIST CREDIT (another UPC has the same album, ignoring any "feat." suffix, with a different but overlapping artist credit; track count is ignored). A row can carry more than one note, separated by " | ". Flags never change titles.
