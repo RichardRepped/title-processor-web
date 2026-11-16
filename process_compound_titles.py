@@ -44,6 +44,8 @@ from xml.sax.saxutils import escape
 from lxml import etree
 import pandas as pd
 
+SCRIPT_VERSION = "2026-11-16 review-in-table"
+
 PLATFORM_PRIORITY = {"Apple": 0, "Spotify": 1, "Tidal": 2}
 
 REVIEW_NOTES = {
@@ -491,6 +493,7 @@ def extend_table_xml(info, new_col_letter, name="REVIEW"):
 
 def process(input_path, output_path):
     print(f"\nReading: {input_path}")
+    print(f"Script version: {SCRIPT_VERSION}")
 
     with zipfile.ZipFile(input_path, "r") as zin:
         sheet_part = find_sheet_part(zin, "IMPORT")

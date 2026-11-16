@@ -121,10 +121,19 @@ if uploaded_file is not None:
 </div>
 """, unsafe_allow_html=True)
 
+                import re as _re
+                _ver = _re.search(r"Script version: (.+)", summary)
+                _rv = _re.search(r"REVIEW column: ([A-Z]+) \((.*?)\)", summary)
+                if _rv:
+                    st.caption(f"REVIEW column {_rv.group(1)}: {_rv.group(2)}."
+                               + (f" Script version: {_ver.group(1).strip()}." if _ver else ""))
+                else:
+                    st.caption("Script version: " + (_ver.group(1).strip() if _ver else "older than 2026-11-16 (REVIEW placement not reported)") + ".")
+
                 if flagged > 0:
                     st.info(
                         f"**{flagged} rows need your attention.** "
-                        "In the downloaded file, filter the REVIEW column (the last column on the IMPORT sheet) to see which rows "
+                        "In the downloaded file, filter the REVIEW column on the IMPORT sheet to see which rows "
                         "need a decision. "
                         "The note says why: MULTI-ARTIST (different credits across DSPs), "
                         "TIDAL-ONLY (no matching sibling), NO DATA (nothing to build a title from), "
