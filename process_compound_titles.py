@@ -14,7 +14,10 @@ Rules applied:
     3. Tidal-only UPCs: look for a sibling UPC sharing the same album name AND the
        same number of audio tracks that has Apple/Spotify data, and use that compound
        title. Artist names are not compared (Tidal often shows them differently).
-    4. Remaining genuine edge cases are flagged in a REVIEW column placed
+    4. UPCs that share an album (feat. suffixes ignored) with another UPC whose artist
+       credit differs but overlaps are flagged SAME ALBUM, DIFFERENT ARTIST CREDIT
+       (review only; titles are not changed; track count is ignored).
+    5. Remaining genuine edge cases are flagged in a REVIEW column placed
        immediately after the last column of the IMPORT sheet (AM in the current layout).
 
 Output format:
@@ -175,6 +178,83 @@ def compute_titles(df):
 
     return (pd.Series(ct, index=df.index, dtype=object),
             pd.Series(res, index=df.index, dtype=object))
+
+
+# ── Same album, different artist credit (review flag only; titles are not changed) ──
+
+_FEAT_BRACKET = re.compile(r'\s*[\(\[]\s*(?:feat\b|ft\b|featuring\b)[^\)\]]*[\)\]]', re.I)
+_FEAT_TRAIL = re.compile(r'\s+(?:[-–]\s*)?(?:feat\.?|ft\.?|featuring)\s+.*$', re.I)
+_TRACKS_SUFFIX = re.compile(r'\s+-\s+(?:\d+|unknown)\s+tracks?\s*$', re.I)
+
+SAME_ALBUM_NOTE = "SAME ALBUM, DIFFERENT ARTIST CREDIT"
+
+
+def album_key(name):
+    """Album name for comparison: case/spacing ignored and any 'feat./ft./featuring'
+    part removed, because featured-artist suffixes are inconsistent across DSPs.
+    Other suffixes such as (Deluxe) or (Remix) are kept: they are real product differences."""
+    if _isna(name):
+        return ""
+    s = _FEAT_BRACKET.sub("", str(name).strip())
+    s = _FEAT_TRAIL.sub("", s)
+    return re.sub(r"\s+", " ", s).lower().strip(" -")
+
+
+def _title_artist(title, albums):
+    """Artist part of an 'Artist - Album - N tracks' title."""
+    t = _TRACKS_SUFFIX.sub("", str(title))
+    tl = t.lower()
+    for a in sorted(albums, key=len, reverse=True):
+        suf = " - " + a.strip().lower()
+        if tl.endswith(suf):
+            return t[:len(t) - len(suf)]
+    return t.split(" - ", 1)[0]
+
+
+def _artist_names(artist_part):
+    return {x.strip() for x in norm(artist_part).split(",") if x.strip()}
+
+
+def related_album_flags(upcs, art, alb, titles):
+    """{UPC: note} for UPCs that share an album (feat. suffixes ignored) with another UPC
+    whose artist credit differs but overlaps by at least one artist name. Track count is
+    deliberately ignored. Needs no extra rows; works on the final titles."""
+    by_upc = {}
+    for i, u in enumerate(upcs):
+        by_upc.setdefault(u, []).append(i)
+
+    info, groups = {}, {}
+    for u, idx in by_upc.items():
+        real = [i for i in idx if not _isna(art[i])]
+        title = next((titles[i] for i in idx if isinstance(titles[i], str) and titles[i]), None)
+        if not real or title is None:
+            continue
+        albums = {str(alb[i]) for i in real if not _isna(alb[i]) and str(alb[i]).strip()}
+        keys = {album_key(a) for a in albums} - {""}
+        if not keys:
+            continue
+        artist = _title_artist(title, albums)
+        info[u] = (title, norm(artist), _artist_names(artist))
+        for k in keys:
+            groups.setdefault(k, []).append(u)
+
+    related = {}
+    for us in groups.values():
+        for a in range(len(us)):
+            for b in range(a + 1, len(us)):
+                ua, ub = us[a], us[b]
+                if info[ua][1] != info[ub][1] and info[ua][2] & info[ub][2]:
+                    related.setdefault(ua, {})[ub] = None
+                    related.setdefault(ub, {})[ua] = None
+
+    notes = {}
+    for u, others in related.items():
+        ol = list(others)
+        txt = f"{SAME_ALBUM_NOTE}: also UPC {ol[0]} – {info[ol[0]][0]}"
+        if len(ol) > 1:
+            txt += f" (+{len(ol) - 1} more)"
+        notes[u] = txt
+    return notes
 
 
 # ── Worksheet / shared-string plumbing ────────────────────────────────────────
@@ -386,6 +466,17 @@ def process(input_path, output_path):
 
     compound_titles, resolution = compute_titles(df)
 
+    # One REVIEW note per row: the resolution note and/or the same-album note
+    upc_list = df["UPC"].tolist()
+    same_album = related_album_flags(upc_list, df["Artist name"].tolist(),
+                                     df["Album name"].tolist(), compound_titles.tolist())
+    row_notes = []
+    for u, rk in zip(upc_list, resolution.tolist()):
+        parts = [REVIEW_NOTES.get(rk), same_album.get(u)]
+        row_notes.append(" | ".join(p for p in parts if p))
+    n_flagged = sum(1 for x in row_notes if x)
+    n_same_album = sum(1 for u in upc_list if u in same_album)
+
     # Summary (same lines the web app parses)
     c = resolution.value_counts()
     print(f"\n{'='*55}")
@@ -396,10 +487,11 @@ def process(input_path, output_path):
     print(f"    – harmonised                : {c.get('auto',0)}")
     print(f"    – blank rows propagated     : {c.get('propagated',0)}")
     print(f"  Tidal-only via sibling lookup : {c.get('sibling',0)}")
-    print(f"  Flagged for review            : {c.get('tidal_only',0) + c.get('edge_multi',0) + c.get('no_data',0)}")
+    print(f"  Flagged for review            : {n_flagged}")
     print(f"    – Tidal-only, no sibling    : {c.get('tidal_only',0)}")
     print(f"    – Genuine multi-artist      : {c.get('edge_multi',0)}")
     print(f"    – No data on any DSP        : {c.get('no_data',0)}")
+    print(f"    – Same album, other artist  : {n_same_album} (may overlap with the above)")
     print(f"  Null remaining                : {compound_titles.isna().sum()}")
     print(f"{'='*55}")
 
@@ -463,7 +555,7 @@ def process(input_path, output_path):
                 inner = put(ct_col, ct_cell, inner)
                 stats["written"] += 1
                 stats["refs_added"] += 1
-            note = REVIEW_NOTES.get(res)
+            note = row_notes[pos]
             if note:
                 nidx = sidx(note)
                 inner = put(review_col,
@@ -537,8 +629,8 @@ def process(input_path, output_path):
             os.remove(tmp_out)
         raise
 
-    flagged = c.get("tidal_only", 0) + c.get("edge_multi", 0) + c.get("no_data", 0)
-    edge_upcs = df[resolution.isin(["tidal_only", "edge_multi", "no_data"])]["UPC"].nunique()
+    flagged = n_flagged
+    edge_upcs = len({u for u, x in zip(upc_list, row_notes) if x})
     print(f"Compound titles written: {stats['written']} of {len(df)} rows; "
           f"REVIEW column: {review_col}")
     print(f"Done. {flagged} rows flagged across {edge_upcs} UPCs.\n")
