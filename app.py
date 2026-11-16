@@ -126,8 +126,9 @@ if uploaded_file is not None:
                         f"**{flagged} rows need your attention.** "
                         "In the downloaded file, filter the REVIEW column (the last column on the IMPORT sheet) to see which rows "
                         "need a decision. "
-                        "🟠 Orange = different artist credits across DSPs. "
-                        "🔵 Blue = Tidal-only, no matching sibling found."
+                        "The note says why: MULTI-ARTIST (different credits across DSPs), "
+                        "TIDAL-ONLY (no matching sibling), NO DATA (nothing to build a title from), "
+                        "or SAME ALBUM, DIFFERENT ARTIST CREDIT (another UPC has the same album with a different artist credit)."
                     )
 
                 st.download_button(
